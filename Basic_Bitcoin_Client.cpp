@@ -11,11 +11,135 @@
 
 using namespace std;
 
+void sha256(char *string, char outputBuffer[65])
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+    SHA256_Update(&sha256, string, strlen(string));
+    SHA256_Final(hash, &sha256);
+    int i = 0;
+    for(i = 0; i < SHA256_DIGEST_LENGTH; i++)
+    {
+        sprintf(outputBuffer + (i * 2), "%02x", hash[i]);
+    }
+    outputBuffer[64] = 0;
+}
+
+
+/*
+EVP_PKEY* should be of the type EVP_PKEY_EC only
+The public key for Verification of signature should be of the same type
+*/
+
+unsigned char* Create_ECDSA_Signature(size_t* &slen, EVP_PKEY* key, const char* msg)
+{
+	EVP_MD_CTX *mdctx = NULL;
+	int ret = 0;
+	 
+	unsigned char **sig=new unsigned char*;
+        *sig=NULL;
+	 
+	/* Create the Message Digest Context */
+	if(!(mdctx = EVP_MD_CTX_create())) return NULL;
+	
+	/* Initialise the DigestSign operation - SHA-256 has been selected as the message digest function*/
+	 if(1 != EVP_DigestSignInit(mdctx, NULL, EVP_sha256(), NULL, key)) return NULL;
+	 
+	 /* Call update with the message */
+	 if(1 != EVP_DigestSignUpdate(mdctx, msg, strlen(msg))) return NULL;
+	
+	 /* Finalise the DigestSign operation */
+	 /* First call EVP_DigestSignFinal with a NULL sig parameter to obtain the length of the
+	  * signature. Length is returned in slen */
+   
+	 if(1 != EVP_DigestSignFinal(mdctx, NULL, slen)) {cout<<"NOOOO"<<endl;return NULL;}
+        
+	 /* Allocate memory for the signature based on size in slen */
+	 if(!(*sig = new unsigned char[sizeof(unsigned char) * (*slen)] )) return NULL;
+	
+         /* Obtain the signature */
+	 if(1 != EVP_DigestSignFinal(mdctx, *sig, slen)) return NULL;
+	
+	 /* Success */
+	 ret = 1;
+	 
+	 if(mdctx) EVP_MD_CTX_destroy(mdctx);
+	
+	 /* Clean up */
+	 return *sig;	 
+}
+
+bool Verify_ECDSA_Signature(unsigned char* sig, size_t slen, const char* msg, EVP_PKEY* Pubkey)
+{
+	EVP_MD_CTX *mdctx = NULL;
+        if(!(mdctx = EVP_MD_CTX_create())) return false;
+	/* Initialize 'Pubkey' with a public key */
+
+	if(1 != EVP_DigestVerifyInit(mdctx, NULL, EVP_sha256(), NULL, Pubkey)) return false;
+
+	if(1 != EVP_DigestVerifyUpdate(mdctx, msg, strlen(msg))) return false;
+
+	if(1 == EVP_DigestVerifyFinal(mdctx, sig, slen))
+	{
+            if(mdctx) EVP_MD_CTX_destroy(mdctx);
+	    return true;
+	}
+   
+       if(mdctx) EVP_MD_CTX_destroy(mdctx);
+       return false;
+	
+}
+
+
+bool Generate_params_key_ECDSA(EVP_PKEY*& params, EVP_PKEY*& key, EVP_PKEY_CTX*& pctx, EVP_PKEY_CTX*& kctx)
+{  
+    
+  
+  /* Create the context for generating the parameters */
+  if(!(pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL))) return false;
+  if(!EVP_PKEY_paramgen_init(pctx)) return false;
+  //cout<<"NIC"<<endl;
+  /* Set the paramgen parameters */
+  /* Use the NID_X9_62_prime256v1 named curve - defined in obj_mac.h */
+
+  if(!EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1)) return false;		
+
+  /* Generate parameters */
+  if (!EVP_PKEY_paramgen(pctx, &params)) return false;
+
+
+  if(params != NULL)
+  {
+    if(!(kctx = EVP_PKEY_CTX_new(params, NULL))) return false; 
+  }
+  else
+  {
+    /* Create context for the key generation */
+    if(!(kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL))) return false;
+  }
+
+  if(!EVP_PKEY_keygen_init(kctx)) return false;
+
+  /* Generate the key */
+  if (!EVP_PKEY_keygen(kctx, &key)) return false;
+
+  return true;
+}
+
+
+
+
+
+
 
 /*
 Format of the transaction message string:
 
 "trans-transid1|outfield1#transid2|outfield2#transid3|outfield3-pubkey1|amount#pubkey2|amount2-transfee-signature-payerpublickey"
+
+String used for signing:
+"trans-transid1|outfield1#transid2|outfield2#transid3|outfield3-pubkey1|amount#pubkey2|amount2-transfee"
 
 */ 
 
@@ -24,20 +148,15 @@ class Transaction
 {
   public:
 
-  string transid;
   string payer_publickey;
   vector<pair<long long,long long> > input_fields;
   vector<pair<long long,long long> > output_fields;
   long long trans_fee;
   string Signature;
-/////Variables not sent by msg////
-//  EVP_PKEY* Pubkey11;
-//  unsigned char* Sign;
-//  size_t siglen;
- // 
 
 Transaction()
 {
+    trans_fee=0;
     
 
 }
@@ -195,127 +314,84 @@ void clearfields()
   output_fields.resize(0);
 }
 
+bool set_Signature(unsigned char* &Sign, size_t slen)
+{
+ if(slen<1) return false;
+ Signature="";
+ for(size_t i=0;i<slen;i++)
+{
+  Signature+=to_string((int)Sign[i]);
+  if(i!=(slen-1)) Signature+="|";  
+}
 
+delete[] Sign;
+return true;
+
+}
+
+unsigned char* get_Signature_in_unsigned(size_t &slen)
+{
+/*
+Use only if the string Signature is set first
+*/
+  unsigned char** Sig=new unsigned char*;
+  *Sig=NULL;
+  stringstream convert;
+  long int temp;
+  vector<long int> temp_v;
+  while((pos=Signature.find("|"))!=std::string::npos)
+  {
+    convert << Signature.substr(0,pos);
+    convert >> temp;
+    temp_v.push_back(temp);
+    convert.str("");
+    convert.clear();
+    msg.erase(0, pos+1);
+  }  
+  convert << Signature;
+  convert >> temp;
+  temp_v.push_back(temp);
+  *Sig=new unsigned char[temp_v.size()];
+   slen=temp_v.size();
+   for(long int i=0;i<temp_v.size();i++)
+   {
+      (*Sig)[i]=(unsigned char)temp_v[i]; 
+   }
+   return *Sig;
+}
   
+bool Verify_Signature()
+{
+/*
+Only if both string Signature and string payer_publickey is set first
+*/ 
+    ofstream out2("output.txt");
+    out2 << payer_publickey;
+    out2.close();
+    FILE* fp;
+    fp=fopen("output.txt","r+");
+    EVP_PKEY* Pubkey2=PEM_read_PUBKEY(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if(remove("output.txt")!= 0){cout<<"Error deleting file"<<endl; return false;}
+
+    unsigned char* sig2=(*this).get_Signature_in_unsigned();
+    string buf="trans-"+(*this).construct_io_fields(0)+"-"+(*this).construct_io_fields(1)+"-"+to_string(trans_fee);
+    char buffer[65];
+    char* buf2=new char[buf.length()];
+    strcpy(buf2,buf.c_str());
+    sha256(buf2, buffer);
+
+    bool a=Verify_ECDSA_Signature(sig2, Signature.length(), buffer, Pubkey2));
+
+
+}
+
+
+
 
 };
 
 
-void sha256(char *string, char outputBuffer[65])
-{
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    SHA256_Update(&sha256, string, strlen(string));
-    SHA256_Final(hash, &sha256);
-    int i = 0;
-    for(i = 0; i < SHA256_DIGEST_LENGTH; i++)
-    {
-        sprintf(outputBuffer + (i * 2), "%02x", hash[i]);
-    }
-    outputBuffer[64] = 0;
-}
-
-
-/*
-EVP_PKEY* should be of the type EVP_PKEY_EC only
-The public key for Verification of signature should be of the same type
-*/
-
-unsigned char* Create_ECDSA_Signature(size_t* &slen, EVP_PKEY* key, const char* msg)
-{
-	EVP_MD_CTX *mdctx = NULL;
-	int ret = 0;
-	 
-	unsigned char **sig=new unsigned char*;
-        *sig=NULL;
-	 
-	/* Create the Message Digest Context */
-	if(!(mdctx = EVP_MD_CTX_create())) return NULL;
-	
-	/* Initialise the DigestSign operation - SHA-256 has been selected as the message digest function*/
-	 if(1 != EVP_DigestSignInit(mdctx, NULL, EVP_sha256(), NULL, key)) return NULL;
-	 
-	 /* Call update with the message */
-	 if(1 != EVP_DigestSignUpdate(mdctx, msg, strlen(msg))) return NULL;
-	
-	 /* Finalise the DigestSign operation */
-	 /* First call EVP_DigestSignFinal with a NULL sig parameter to obtain the length of the
-	  * signature. Length is returned in slen */
-   
-	 if(1 != EVP_DigestSignFinal(mdctx, NULL, slen)) {cout<<"NOOOO"<<endl;return NULL;}
-        
-	 /* Allocate memory for the signature based on size in slen */
-	 if(!(*sig = new unsigned char[sizeof(unsigned char) * (*slen)] )) return NULL;
-	
-         /* Obtain the signature */
-	 if(1 != EVP_DigestSignFinal(mdctx, *sig, slen)) return NULL;
-	
-	 /* Success */
-	 ret = 1;
-	 
-	 if(mdctx) EVP_MD_CTX_destroy(mdctx);
-	
-	 /* Clean up */
-	 return *sig;	 
-}
-
-bool Verify_ECDSA_Signature(unsigned char* sig, size_t slen, const char* msg, EVP_PKEY* Pubkey)
-{
-	EVP_MD_CTX *mdctx = NULL;
-        if(!(mdctx = EVP_MD_CTX_create())) return false;
-	/* Initialize 'Pubkey' with a public key */
-
-	if(1 != EVP_DigestVerifyInit(mdctx, NULL, EVP_sha256(), NULL, Pubkey)) return false;
-
-	if(1 != EVP_DigestVerifyUpdate(mdctx, msg, strlen(msg))) return false;
-
-	if(1 == EVP_DigestVerifyFinal(mdctx, sig, slen))
-	{
-            if(mdctx) EVP_MD_CTX_destroy(mdctx);
-	    return true;
-	}
-   
-       if(mdctx) EVP_MD_CTX_destroy(mdctx);
-       return false;
-	
-}
-
-
-bool Generate_params_key_ECDSA(EVP_PKEY*& params, EVP_PKEY*& key, EVP_PKEY_CTX*& pctx, EVP_PKEY_CTX*& kctx)
-{  
-    
-  
-  /* Create the context for generating the parameters */
-  if(!(pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL))) return false;
-  if(!EVP_PKEY_paramgen_init(pctx)) return false;
-  //cout<<"NIC"<<endl;
-  /* Set the paramgen parameters */
-  /* Use the NID_X9_62_prime256v1 named curve - defined in obj_mac.h */
-
-  if(!EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1)) return false;		
-
-  /* Generate parameters */
-  if (!EVP_PKEY_paramgen(pctx, &params)) return false;
-
-
-  if(params != NULL)
-  {
-    if(!(kctx = EVP_PKEY_CTX_new(params, NULL))) return false; 
-  }
-  else
-  {
-    /* Create context for the key generation */
-    if(!(kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL))) return false;
-  }
-
-  if(!EVP_PKEY_keygen_init(kctx)) return false;
-
-  /* Generate the key */
-  if (!EVP_PKEY_keygen(kctx, &key)) return false;
-
-  return true;
-}
 
 class Merkleblock
 {
@@ -923,6 +999,23 @@ class node
      else cout<<"Error in generating keys and parameters"<<endl;        
    }
 
+   bool create_trans_signature(Transaction& T)
+   {
+     /*
+      Returns true if it assigns the string Signature of the Transaction T successfully 
+     */
+     string buf="trans-"+T.construct_io_fields(0)+"-"+T.construct_io_fields(1)+"-"+to_string(T.trans_fee);
+     char buffer[65];
+     char* buf2=new char[buf.length()];
+     strcpy(buf2,buf.c_str());
+     sha256(buf2, buffer);
+     //buffer contains the hash to be signed.It would be hashed again by while signing -> double hashing.
+     size_t* slen_sig=new size_t;
+     unsigned char* Sign=Create_ECDSA_Signature(slen_sig, key, buffer);
+     return T.set_Signature(Sign, *slen_sig);
+   }
+
+
   
 
 };
@@ -969,8 +1062,6 @@ int main()
 
 
 
-
-
     char buffer[65];
     sha256("string", buffer);
     printf("%s\n", buffer);
@@ -993,7 +1084,11 @@ int main()
     char* buff1111;
 
     cout<<test.length()<<"   "<<*slen<<endl;
+        
+
     if(!Verify_ECDSA_Signature(mqw1111, test.length(), buffer, Pubkey1)) cout<<"Invalid Signature"<<endl;
     else cout<<"Signature verified by Public key"<<endl;
+
+    
     return 0;
 }
